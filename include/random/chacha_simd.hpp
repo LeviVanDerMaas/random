@@ -3,36 +3,37 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <iostream>
 #include <limits>
 #include <utility>
 #include <xsimd/xsimd.hpp>
 
 #include "random/macros.hpp"
+#include "xsimd/config/xsimd_arch.hpp"
 #include "xsimd/types/xsimd_api.hpp"
 
 namespace prng {
 
-template <std::uint8_t R, class Arch>
+namespace internal {
+  template <std::uint8_t R>
+  struct ChaChaSIMDCreator;
+}
+
+template <std::uint8_t R = 20>
 class ChaChaSIMD {
-protected:
+public:
   static constexpr auto MATRIX_ROW_LEN = std::uint8_t{4};
   static constexpr auto MATRIX_COL_LEN = std::uint8_t{4};
   static constexpr auto MATRIX_WORDCOUNT = std::uint8_t{16};
+  static constexpr auto CACHE_BLOCKCOUNT = std::uint16_t{std::numeric_limits<std::uint8_t>::max() + 1};
   static constexpr auto KEY_WORDCOUNT = std::uint8_t{8};
 
-public:
   using input_word = std::uint64_t;
   using matrix_word = std::uint32_t;
   using matrix_type = std::array<matrix_word, MATRIX_WORDCOUNT>;
+  using cache_type = std::array<matrix_word, CACHE_BLOCKCOUNT * MATRIX_WORDCOUNT>;
   using rounds_type = std::uint8_t;
-  using simd_type = xsimd::batch<matrix_word, Arch>;
 
-protected:
-  static constexpr std::uint8_t SIMD_WIDTH = std::uint8_t{simd_type::size};
-  static constexpr auto CACHE_WORDCOUNT = std::uint16_t{MATRIX_WORDCOUNT * SIMD_WIDTH};
-  static constexpr auto CACHE_BLOCKCOUNT = SIMD_WIDTH;
-
-public:
   /**
    * @brief Construct a SIMD ChaCha generator with given key, counter and nonce
    * @param key A 256-bit key, divided up into eight 32-bit words.
@@ -44,6 +45,10 @@ public:
     const input_word counter,
     const input_word nonce
   ) {
+
+    // TODO: Test with more than the default arch
+    pImpl = xsimd::dispatch<xsimd::arch_list<xsimd::default_arch>>(internal::ChaChaSIMDCreator<R>{m_state, m_cache})();
+
     // First four words (i.e. top-row) are always the same constants
     // They spell out "expand 2-byte k" in ASCII (little-endian)
     m_state[0] = 0x61707865;
@@ -67,37 +72,59 @@ public:
    * @return The next random block.
    */
   PRNG_ALWAYS_INLINE constexpr matrix_type operator()() noexcept {
-    if (m_index >= CACHE_BLOCKCOUNT) [[unlikely]] {
-      gen_next_blocks_in_cache();
-      m_index = 0;
+    if (m_index == 0) [[unlikely]] {
+      pImpl->populate_cache();
     }
     matrix_word *cache_block = m_cache.data() + (m_index++ * MATRIX_WORDCOUNT);
-    matrix_type block;
-    std::copy(cache_block, cache_block + MATRIX_WORDCOUNT, block.begin());
-    return block;
+    matrix_type out_block;
+    std::copy(cache_block, cache_block + MATRIX_WORDCOUNT, out_block.begin());
+    return out_block;
   }
 
   /**
-   * @brief Returns the state of the generator; a 4x4 matrix.
-   * @return State of the generator.
+   * Abstract interface to hide the templated implementation.
    */
-  PRNG_ALWAYS_INLINE constexpr matrix_type getState() const noexcept {
-    matrix_type state = m_state;
-    if (m_index < CACHE_BLOCKCOUNT) {
-      input_word counter = (static_cast<input_word>(state[13]) << 32) | static_cast<input_word>(state[12]);
-      counter -= static_cast<input_word>(CACHE_BLOCKCOUNT - m_index);
-      state[12] = static_cast<matrix_word>(counter & 0xFFFFFFFF);
-      state[13] = static_cast<matrix_word>(counter >> 32);
-    }
-    return state;
-  }
-
+  struct IChaChaSIMD {
+    virtual ~IChaChaSIMD() = default;
+    virtual void populate_cache() = 0;
+  };
 
 private:
   matrix_type m_state;
-  std::array<matrix_word, CACHE_WORDCOUNT> m_cache;
-  // Initalize to "past end of the cache" since cache starts empty
-  std::uint8_t m_index = CACHE_BLOCKCOUNT;
+  std::unique_ptr<IChaChaSIMD> pImpl;
+  cache_type m_cache;
+  std::uint8_t m_index{0}; // Make sure this is 0
+};
+
+
+
+namespace internal {
+
+template <class Arch, std::uint8_t R>
+class ChaChaSIMDImpl : public ChaChaSIMD<>::IChaChaSIMD {
+public:
+  using matrix_word = ChaChaSIMD<>::matrix_word;
+  using matrix_type = ChaChaSIMD<>::matrix_type;
+  using cache_type =  ChaChaSIMD<>::cache_type;
+  using simd_type = xsimd::batch<matrix_word, Arch>;
+
+  static constexpr std::uint8_t SIMD_WIDTH = std::uint8_t{simd_type::size};
+  static constexpr auto MATRIX_WORDCOUNT = ChaChaSIMD<>::MATRIX_WORDCOUNT;
+  static constexpr auto CACHE_BLOCKCOUNT = std::uint16_t{std::numeric_limits<std::uint8_t>::max() + 1};
+  static constexpr auto CACHE_WORDCOUNT = std::uint16_t{CACHE_BLOCKCOUNT * MATRIX_WORDCOUNT};
+
+  PRNG_ALWAYS_INLINE explicit ChaChaSIMDImpl(matrix_type &state, cache_type &cache) : m_state{state}, m_cache{cache} {};
+
+  PRNG_ALWAYS_INLINE void populate_cache() noexcept override {
+    std::cout << Arch::name() << std::endl;
+    for (auto i = 0; i < CACHE_WORDCOUNT; i += SIMD_WIDTH * MATRIX_WORDCOUNT) {
+      next_blocks(m_cache.data() + i);
+    }
+  }
+
+private:
+  matrix_type &m_state;
+  cache_type &m_cache;
 
   /**
    * Return an array { 0, 1 * step, ..., (n - 1) * step }. Can be used to initialize a batch for
@@ -114,7 +141,8 @@ private:
    * batch for incremetinng elements in a batch of consecutive high counter words, depending on at
    * what index the corresponding lower counter words had an overflow.
    */
-  PRNG_ALWAYS_INLINE static constexpr std::array<matrix_word, SIMD_WIDTH> make_higher_counter_inc(std::uint8_t n) noexcept {
+  // TODO: Restore the macro PRNG_ALWAYS_INLINE use here, I removed it cuz it messes up treesitter.
+  static constexpr std::array<matrix_word, SIMD_WIDTH> make_higher_counter_inc(std::uint8_t n) noexcept {
     std::array<matrix_word, SIMD_WIDTH> incs;
     incs[0] = 0;
     for (auto i = 1; i < SIMD_WIDTH; ++i) {
@@ -124,11 +152,12 @@ private:
   }
 
   /**
-   * Generates `SIMD_WIDTH` new ChaCha blocks, and write them all into the cache. Will overwrite
-   * anything else in the cache.
+   * Given an initial state, generates `SIMD_WIDTH` new ChaCha blocks and
+   * stores them sequentially at the given address. Will increment the state's
+   * counter words by `SIMD_WIDTH`.
    */
-  PRNG_ALWAYS_INLINE constexpr void gen_next_blocks_in_cache() noexcept {
-    alignas(simd_type::arch_type::alignment()) simd_type lower_counter_inc, higher_counter_inc;
+  PRNG_ALWAYS_INLINE constexpr void next_blocks(matrix_word *out) noexcept {
+    simd_type lower_counter_inc, higher_counter_inc;
     lower_counter_inc =
       xsimd::load_unaligned(matrix_word_sequence(std::make_index_sequence<SIMD_WIDTH>{}).data());
     matrix_word overflow_index = std::numeric_limits<matrix_word>::max() - m_state[12];
@@ -137,6 +166,7 @@ private:
     } else {
       higher_counter_inc = simd_type::broadcast(0);
     }
+
 
     simd_type x[MATRIX_WORDCOUNT];
     for (auto i = 0; i < MATRIX_WORDCOUNT; ++i) {
@@ -275,14 +305,43 @@ private:
     x[13] += higher_counter_inc;
 
     // Batch i contains the i'th word of all chacha blocks, so transpose to get rows of chacha blocks.
-    alignas(simd_type::arch_type::alignment()) simd_type scatter_offsets =
+    simd_type scatter_offsets =
       xsimd::load_unaligned(matrix_word_sequence(std::make_index_sequence<SIMD_WIDTH>{}, MATRIX_WORDCOUNT).data());
     for (auto i = 0; i < MATRIX_WORDCOUNT; ++i) {
-      x[i].scatter(m_cache.data() + i, scatter_offsets);
+      x[i].scatter(out + i, scatter_offsets);
     }
 
     m_state[12] += SIMD_WIDTH;
     m_state[13] += overflow_index < SIMD_WIDTH;
   }
 };
-}
+
+
+template <std::uint8_t R>
+struct ChaChaSIMDCreator {
+  typename ChaChaSIMD<R>::matrix_type &state;
+  typename ChaChaSIMD<R>::cache_type &cache;
+  template <class Arch>
+  std::unique_ptr<typename ChaChaSIMD<R>::IChaChaSIMD> operator()(Arch) const;
+};
+
+template <std::uint8_t R>
+template <class Arch>
+std::unique_ptr<typename ChaChaSIMD<R>::IChaChaSIMD> ChaChaSIMDCreator<R>::operator()(Arch) const {
+  return std::make_unique<ChaChaSIMDImpl<Arch, R>>(state, cache);
+};
+
+
+
+
+
+
+
+
+
+
+
+
+} // namespace internal
+
+} // namespace prng
