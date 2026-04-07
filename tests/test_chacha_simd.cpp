@@ -23,7 +23,7 @@ TEST_CASE("SEED", "[chacha]") {
   ChaCha20Reference chaCha20Reference(key, counter, nonce);
   ChaCha20SIMD chaCha20SIMD(key, counter, nonce);
   for (auto i = 0; i < seed_tests; ++i) {
-    // REQUIRE(chaCha20SIMD.getState() == chaCha20Reference.getState());
+    REQUIRE(chaCha20SIMD.getState() == chaCha20Reference.getState());
     REQUIRE(chaCha20SIMD.block() == chaCha20Reference.block());
   }
 }

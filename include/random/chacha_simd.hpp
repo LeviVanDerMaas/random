@@ -77,8 +77,9 @@ public:
     const input_word counter,
     const input_word nonce
   ) {
-    // TODO: Make sure you properly initalize the implementation's state with these!
-    pImpl = xsimd::dispatch<xsimd::arch_list<xsimd::default_arch>>(internal::ChaChaSIMDCreator<R>{key, counter, nonce})();
+    // TODO: Don't do it this way but use extern and a proper creator function to ensure other architectures
+    // are compiled into the binary.
+    pImpl = xsimd::dispatch<xsimd::arch_list<xsimd::best_arch>>(internal::ChaChaSIMDCreator<R>{key, counter, nonce})();
   }
 
   /**
@@ -92,7 +93,7 @@ public:
     }
     return m_result_cache[m_result_index++];
   }
-  
+
   /**
    * @brief Generates a uniform random number in the range [0, 1).
    * @return A uniform random number.
@@ -101,11 +102,6 @@ public:
     return static_cast<double>(operator()() >> 11) * 0x1.0p-53;
   }
 
-  // TODO: block()
-  // if we're not at the end of the result cache, should return the whole result cache
-  // as matrix_type and then set the result cache index past the end to invalidate it.
-  // Otherwise it should return the next block. Means in the implementation we can return
-  // just the next block, which leaves just a 'return next_block' call, so we can cut it in the implementation
   /**
    * @brief Generates the next 64-byte ChaCha block.
    * @return The next 64-byte ChaCha block.
@@ -119,28 +115,25 @@ public:
     return pImpl->next_block();
   }
 
-  // TODO: getState() will likely need direct access to impl for this
-  // /**
-  //  * @brief Returns the state of the generator; a 4x4 matrix.
-  //  * @return State of the generator.
-  //  */
-  // PRNG_ALWAYS_INLINE constexpr matrix_type getState() const noexcept {
-  //   matrix_type state = m_state;
-  //   if (m_cache_index < CACHE_BLOCKCOUNT || m_result_index < m_result_cache.size()) {
-  //     input_word counter = (static_cast<input_word>(state[13]) << 32) | static_cast<input_word>(state[12]);
-  //     counter -= static_cast<input_word>(CACHE_BLOCKCOUNT - m_cache_index);
-  //     if (m_result_index < m_result_cache.size()) {
-  //       --counter;
-  //     }
-  //     state[12] = static_cast<matrix_word>(counter & 0xFFFFFFFF);
-  //     state[13] = static_cast<matrix_word>(counter >> 32);
-  //   }
-  //   return state;
-  // }
+  /**
+   * @brief Returns the state of the generator; a 4x4 matrix.
+   * @return State of the generator.
+   */
+  PRNG_ALWAYS_INLINE constexpr matrix_type getState() const noexcept {
+    return pImpl->getState(m_result_index < m_result_cache.size());
+  }
+
+  /**
+   * @brief Get the number of 32-bit lanes used by the underlying implementation.
+   */
+  PRNG_ALWAYS_INLINE constexpr matrix_type getSIMDSize() const noexcept {
+    return pImpl->getSIMDSize();
+  }
 
   struct IChaChaSIMD {
     virtual ~IChaChaSIMD() = default;
     virtual matrix_type next_block() = 0;
+    virtual matrix_type getState(bool prev) const = 0;
   };
 
 private:
@@ -244,24 +237,28 @@ public:
     m_state[14] = static_cast<matrix_word>(nonce & 0xFFFFFFFF);
     m_state[15] = static_cast<matrix_word>(nonce >> 32);
   }
-  // /**
-  //  * @brief Returns the state of the generator; a 4x4 matrix.
-  //  * @return State of the generator.
-  //  */
-  // PRNG_ALWAYS_INLINE constexpr matrix_type getState() const noexcept {
-  //   matrix_type state = m_state;
-  //   if (m_cache_index < CACHE_BLOCKCOUNT || m_result_index < m_result_cache.size()) {
-  //     input_word counter = (static_cast<input_word>(state[13]) << 32) | static_cast<input_word>(state[12]);
-  //     counter -= static_cast<input_word>(CACHE_BLOCKCOUNT - m_cache_index);
-  //     if (m_result_index < m_result_cache.size()) {
-  //       --counter;
-  //     }
-  //     state[12] = static_cast<matrix_word>(counter & 0xFFFFFFFF);
-  //     state[13] = static_cast<matrix_word>(counter >> 32);
-  //   }
-  //   return state;
-  // }
 
+  /**
+   * Returns the state of the generator; a 4x4 matrix. You may also opt to return what would
+   * have been the previous state; this is useful when a higher-level implementation
+   * further caches individual words of blocks and you want to return the corresponding state.
+   * 
+   * @param prev If true, return what would have been the previous state.
+   * @return State of the generator.
+   */
+  PRNG_ALWAYS_INLINE matrix_type getState(bool prev) const noexcept override {
+    matrix_type state = m_state;
+    if (m_cache_index < CACHE_BLOCKCOUNT || prev) {
+      input_word counter = (static_cast<input_word>(state[13]) << 32) | static_cast<input_word>(state[12]);
+      counter -= static_cast<input_word>(CACHE_BLOCKCOUNT - m_cache_index);
+      if (prev) {
+        --counter;
+      }
+      state[12] = static_cast<matrix_word>(counter & 0xFFFFFFFF);
+      state[13] = static_cast<matrix_word>(counter >> 32);
+    }
+    return state;
+  }
 
 private:
   matrix_type m_state;
