@@ -79,7 +79,7 @@ public:
   ) {
     // TODO: Don't do it this way but use extern and a proper creator function to ensure other architectures
     // are compiled into the binary.
-    pImpl = xsimd::dispatch<xsimd::arch_list<xsimd::best_arch>>(internal::ChaChaSIMDCreator<R>{key, counter, nonce})();
+    pImpl = xsimd::dispatch<xsimd::arch_list<xsimd::avx512f, xsimd::fma3<xsimd::avx2>, xsimd::sse4_2, xsimd::sse2>>(internal::ChaChaSIMDCreator<R>{key, counter, nonce})();
   }
 
   /**
@@ -121,13 +121,6 @@ public:
    */
   PRNG_ALWAYS_INLINE constexpr matrix_type getState() const noexcept {
     return pImpl->getState(m_result_index < m_result_cache.size());
-  }
-
-  /**
-   * @brief Get the number of 32-bit lanes used by the underlying implementation.
-   */
-  PRNG_ALWAYS_INLINE constexpr matrix_type getSIMDSize() const noexcept {
-    return pImpl->getSIMDSize();
   }
 
   struct IChaChaSIMD {
@@ -288,7 +281,7 @@ private:
     for (auto i = std::size_t{1}; i < SIMD_WIDTH; ++i) {
       incs[i] = static_cast<matrix_word>(overflow_index < i);
     }
-    return xsimd::load_unaligned(incs.data());
+    return simd_type::load_unaligned(incs.data());
   }
 
 
@@ -334,9 +327,9 @@ private:
    * Generates `SIMD_WIDTH` new ChaCha blocks into one cache batch.
    */
   PRNG_ALWAYS_INLINE static void gen_block_batch(cache_batch_type& cache, const matrix_type& state) noexcept {
-    const auto lower_counter_inc = xsimd::load_unaligned(LANE_OFFSETS.data());
+    const simd_type lower_counter_inc = simd_type::load_unaligned(LANE_OFFSETS.data());
     matrix_word overflow_index = std::numeric_limits<matrix_word>::max() - state[12];
-    const auto higher_counter_inc = make_higher_counter_inc(overflow_index);
+    const simd_type higher_counter_inc = make_higher_counter_inc(overflow_index);
 
     working_state_type x;
     init_state_batches(x, state, lower_counter_inc, higher_counter_inc);
@@ -517,6 +510,15 @@ template <class Arch>
 std::unique_ptr<typename ChaChaSIMD<R>::IChaChaSIMD> ChaChaSIMDCreator<R>::operator()(Arch) const {
   return std::make_unique<ChaChaSIMDImpl<Arch, R>>(key, counter, nonce);
 };
+
+extern template std::unique_ptr<ChaChaSIMD<>::IChaChaSIMD>
+ChaChaSIMDCreator<20>::operator()<xsimd::sse2>(xsimd::sse2) const;
+extern template std::unique_ptr<ChaChaSIMD<>::IChaChaSIMD>
+ChaChaSIMDCreator<20>::operator()<xsimd::sse4_2>(xsimd::sse4_2) const;
+extern template std::unique_ptr<ChaChaSIMD<>::IChaChaSIMD>
+ChaChaSIMDCreator<20>::operator()<xsimd::fma3<xsimd::avx2>>(xsimd::fma3<xsimd::avx2>) const;
+extern template std::unique_ptr<ChaChaSIMD<>::IChaChaSIMD>
+ChaChaSIMDCreator<20>::operator()<xsimd::avx512f>(xsimd::avx512f) const;
 
 } // namespace internal
 
